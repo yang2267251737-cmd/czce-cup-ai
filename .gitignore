@@ -1,0 +1,28 @@
+# Secrets and account information
+.env
+.env.*
+!.env.example
+*account*
+*credential*
+*password*
+*token*
+*.pem
+*.key
+
+# Local data and generated files
+data/
+*.csv
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
