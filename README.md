@@ -10,7 +10,9 @@
 
 ## 项目状态
 
-当前为项目骨架阶段，尚无策略实现。代码、数据流程和回测结果将在需求访谈及规格确认后逐步补充。
+已完成第一轮数据探针：抓取 30 分钟行情、保存本地 CSV、生成基础质量报告；支持离线检查和明确标注的模拟数据。尚未实现策略、回测、定时更新或交易功能。
+
+2026-10-06 实测：AkShare 返回 CF0 示例的最近 300 根数据，覆盖 2026-08-25 13:45 至 2026-09-30 15:00。**基础检查通过不代表历史完整或数据实时，也未证明能获取 2–3 年分钟历史。**
 
 ## Project Vision
 
@@ -20,11 +22,34 @@ The system is intended to provide analysis, signals, risk guidance, and review m
 
 ## Status
 
-This is an initial repository skeleton. No strategy implementation or performance claims are included yet.
+A single-file data probe is available. It fetches intraday futures bars, stores local CSV files, and reports basic data quality. Offline CSV validation and clearly labelled simulated data are supported. Strategies, backtests, and scheduled updates are not implemented yet.
 
 ## Code / 代码
 
-TODO: Add code only after requirements and the project specification have been reviewed.
+在仓库根目录运行。已验证环境：Python 3.12.7、pandas 2.2.1、numpy 1.26.4、AkShare 1.18.64。Python 3.13 尚未验证。
+
+```powershell
+# 推荐使用项目虚拟环境；离线检查和模拟模式只需基础依赖
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -X utf8 scripts/data_probe.py --demo
+
+# 联网抓取需要额外安装 AkShare，仅用作数据适配器
+.\.venv\Scripts\python.exe -m pip install -r requirements-data.txt
+.\.venv\Scripts\python.exe -X utf8 scripts/data_probe.py --symbol CF0 --period 30 --limit 300
+
+# 离线重新检查已保存的真实样本
+.\.venv\Scripts\python.exe -X utf8 scripts/data_probe.py --input data/probe/CF0_30m_real.csv
+```
+
+- 数据和运行报告保存在 `data/probe/`，不上传 GitHub。
+- 真行情、模拟数据、离线输入分别使用 `_real`、`_demo`、`_local` 文件名，不相互覆盖。
+- 联网抓取最多等待 30 秒；失败时输出明确标注的模拟数据及降级原因，不自动使用旧行情。
+- 原始数据校验失败时返回非零退出码，只更新对应的诊断报告，不覆盖已保存的 CSV。
+- 检查字段、时间解析、重复、顺序、有限数值、价格区间及成交量；完整率和交易时段检查尚未实现。
+- `CF0` 是接口连续合约示例，并非已选策略品种或可直接交易的具体合约。模拟序列包含非交易时段，只用于流程验证。
+
+详见 [本轮报告](REPORTS/data-probe.md) 和 [决策日志](DOCS/decisions.md)。
 
 ## License
 
