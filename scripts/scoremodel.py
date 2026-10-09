@@ -59,30 +59,62 @@ class ScoreAssumptions:
     return_weight: float = 0.80
     drawdown_weight: float = 0.10
     activity_weight: float = 0.10
+    volatility_weight: float = 0.0
+    """第五届实际使用的第四项。第九届官方通知里没有它，默认 0（不参与计分）。"""
     return_reference: float = 0.20
     """收益率得分拿满所需的总收益率。"""
     drawdown_tolerance: float = 0.15
     """最大回撤到此水平时回撤项归零。"""
     activity_target: float = 0.30
     """活跃度得分拿满所需的有成交交易日占比。"""
+    volatility_tolerance: float = 0.30
+    """年化波动率到此水平时波动率项归零（仅当 volatility_weight > 0 时生效）。"""
     name: str = "第九届官方权重（80/10/10）"
 
     def weight_sum(self) -> float:
-        """三项权重之和，用于自检（应为 1.0）。"""
-        return self.return_weight + self.drawdown_weight + self.activity_weight
+        """各项权重之和，用于自检（有效项应加起来为 1.0）。"""
+        return self.return_weight + self.drawdown_weight + self.activity_weight + self.volatility_weight
 
     def describe(self) -> str:
         """中文描述，写进报告。"""
+        extra = (f"、波动率归零线 {self.volatility_tolerance:.0%}"
+                 if self.volatility_weight > 0 else "")
         return (
             f"{self.name}：收益率满分线 {self.return_reference:.0%}、"
             f"回撤归零线 {self.drawdown_tolerance:.0%}、"
-            f"活跃度目标 {self.activity_target:.0%}；"
-            f"权重 {self.return_weight:.0%}/{self.drawdown_weight:.0%}/{self.activity_weight:.0%}"
+            f"活跃度目标 {self.activity_target:.0%}{extra}；"
+            f"权重 {self.return_weight:.0%}/{self.drawdown_weight:.0%}/"
+            f"{self.activity_weight:.0%}"
+            + (f"/{self.volatility_weight:.0%}" if self.volatility_weight > 0 else "")
         )
+
+
+FIFTH_EDITION = ScoreAssumptions(
+    name="第五届实际权重（净值70/回撤15/波动率15）",
+    return_weight=0.70,
+    drawdown_weight=0.15,
+    activity_weight=0.0,
+    volatility_weight=0.15,
+    return_reference=0.20,
+    drawdown_tolerance=0.15,
+    volatility_tolerance=0.30,
+)
+"""第五届一等奖得主公布的得分反解出来的权重。
+
+他公布：单位净值得分 72.30、回撤得分 80.29、波动率得分 64.54、交易成绩得分 72.34。
+
+    0.70×72.30 + 0.15×80.29 + 0.15×64.54 = 72.3345  → 与公布的 72.34 差 0.0055（在四舍五入误差内）
+    0.80×72.30 + 0.10×80.29 + 0.10×64.54 = 72.3230  → 差 0.0170（超出误差范围）
+
+所以第五届实际用的是 70/15/15，且**第三项是波动率、不是活跃度**。
+第九届官方通知写的是 80/10/10 + 活跃度 —— 两届规则不同。
+本模块把两套都保留，只采信**在两套下都成立**的结论。
+"""
 
 
 DEFAULT_ASSUMPTIONS: tuple[ScoreAssumptions, ...] = (
     ScoreAssumptions(name="中性假设"),
+    FIFTH_EDITION,
     ScoreAssumptions(
         name="收益率线低（容易拿分）",
         return_reference=0.10, drawdown_tolerance=0.20, activity_target=0.20,
@@ -100,7 +132,7 @@ DEFAULT_ASSUMPTIONS: tuple[ScoreAssumptions, ...] = (
         return_weight=0.89, drawdown_weight=0.10, activity_weight=0.01, activity_target=0.30,
     ),
 )
-"""一组覆盖范围的假设，用来检验结论的稳健性。"""
+"""一组覆盖范围的假设。**含第五届实际权重**，用来检验结论是否依赖规则版本。"""
 
 
 def score_components(metrics: dict[str, Any], assumptions: ScoreAssumptions = ScoreAssumptions()) -> dict[str, Any]:
@@ -112,21 +144,28 @@ def score_components(metrics: dict[str, Any], assumptions: ScoreAssumptions = Sc
     return_score = float(np.clip(total_return / assumptions.return_reference, -1.0, 1.0))
     drawdown_score = float(np.clip(1.0 - max_drawdown / assumptions.drawdown_tolerance, 0.0, 1.0))
     activity_score = float(np.clip(active_ratio / assumptions.activity_target, 0.0, 1.0))
+    volatility = float(metrics.get("年化波动率", 0.0) or 0.0)
+    if not np.isfinite(volatility):
+        volatility = 0.0
+    volatility_score = float(np.clip(1.0 - volatility / assumptions.volatility_tolerance, 0.0, 1.0))
     composite = (
         assumptions.return_weight * return_score
         + assumptions.drawdown_weight * drawdown_score
         + assumptions.activity_weight * activity_score
+        + assumptions.volatility_weight * volatility_score
     )
     return {
         "假设": assumptions.name,
         "收益率分项": round(return_score, 4),
         "回撤分项": round(drawdown_score, 4),
         "活跃度分项": round(activity_score, 4),
+        "波动率分项": round(volatility_score, 4),
         "模拟总分": round(composite, 4),
         "总分×100": round(composite * 100, 2),
         "含附加分": round(composite * 100 + THEORY_BONUS, 2),
         "总收益率": round(total_return, 4),
         "最大回撤": round(max_drawdown, 4),
+        "年化波动率": round(volatility, 4),
         "活跃交易日占比": round(active_ratio, 4),
         "达到活跃门槛": bool(metrics.get("有交易天数", 0) >= MIN_ACTIVE_DAYS),
         "_假设参数": asdict(assumptions),
