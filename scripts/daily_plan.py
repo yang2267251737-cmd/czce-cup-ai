@@ -47,6 +47,9 @@ from universe import load_universe
 STATE_PATH = ROOT / "state" / "portfolio.json"
 REPORT_DIR = ROOT / "REPORTS" / "daily"
 
+MIN_ACTIVE_DAYS = 5
+"""官方硬门槛：活跃交易日不得少于 5 天，否则无法参与最终评奖。"""
+
 DEFAULT_STRATEGY = StrategyParams(entry_window=55, exit_window=5, stop_atr=3.0, trail_atr=6.0)
 """默认参数取优化脚本选出的稳健档（慢速宽跟踪）：交易频率低、抗噪、回撤小。"""
 
@@ -60,6 +63,13 @@ class Book:
     positions: list[dict] = field(default_factory=list)
     last_updated: str = ""
     notes: str = ""
+    active_days: list[str] = field(default_factory=list)
+    """有成交的交易日列表（YYYY-MM-DD，按**交易日**口径，夜盘算下一交易日）。
+
+    官方硬门槛：**活跃交易日不得少于 5 天，不满足者无法参与最终评奖**。
+    回测显示这套低频策略在任意 40 个交易日窗口里约有 1.2% 的概率不足 5 天，
+    所以必须单独盯着这个数 —— 它不是加分项，是资格线。
+    """
 
     @property
     def drawdown(self) -> float:
@@ -534,10 +544,13 @@ def _market_section(plan: dict) -> list[str]:
 
 
 def _risk_section(plan: dict, book: dict, guard: dict) -> list[str]:
-    """五、组合风控状态。"""
+    """五、组合风控状态（含官方硬门槛「活跃交易日 ≥ 5 天」的进度）。"""
     drawdown = 0.0 if not book["peak_equity"] else max(0.0, (book["peak_equity"] - book["equity"]) / book["peak_equity"])
+    active = book.get("active_days") or []
+    remaining = max(0, MIN_ACTIVE_DAYS - len(active))
+    status = "✅ 已达门槛" if remaining == 0 else f"⚠️ 还差 {remaining} 天，**达不到将直接失去评奖资格**"
     return [
-        "## 五、组合风控状态",
+        "## 五、组合风控状态与资格门槛",
         "",
         "| 项目 | 数值 |",
         "|---|---|",
@@ -547,8 +560,20 @@ def _risk_section(plan: dict, book: dict, guard: dict) -> list[str]:
         f"| 风险倍数 | {guard['risk_multiplier']:.2f}× |",
         f"| 在手持仓 | {len(book['positions'])} 个 |",
         f"| 剩余保证金额度 | {guard['remaining_margin']:,.0f} 元 |",
+        f"| **活跃交易日进度** | **{len(active)} / {MIN_ACTIVE_DAYS} 天** —— {status} |",
         "",
         f"风控判定：{guard['note']}",
+        "",
+        "> **活跃交易日是资格线，不是加分项。** 官方细则："
+        f"「每个账户活跃交易日不得少于 {MIN_ACTIVE_DAYS} 天。不满足活跃交易日要求的账户"
+        "无法参与最终评奖。」回测显示这套低频策略在任意 40 个交易日窗口里约有 **1.2%** "
+        "的概率不足 5 天 —— 概率不大，但一旦发生，前面所有的收益都作废。",
+        "",
+        "> 每有成交的当天，用这条命令登记（**按交易日口径，夜盘算下一个交易日**）：",
+        "",
+        "> ```powershell",
+        "> python scripts/daily_plan.py --mark-active 2026-10-12",
+        "> ```",
         "",
         "> 回撤触及暂停线时风险降至 1/4，而**不是完全停止交易** —— "
         "回测发现一旦停止开新仓，账户就失去唯一的恢复途径，暂停会被永久锁死。",
@@ -621,11 +646,31 @@ def main() -> None:
     parser.add_argument("--state", default=str(STATE_PATH), help="账簿文件路径")
     parser.add_argument("--out", default=str(REPORT_DIR), help="计划输出目录")
     parser.add_argument("--suffix", default="", help="输出文件名后缀，例如 -tracked")
-    parser.add_argument("--near", type=float, default=0.0,
-                        help="Distance filter: only orders within X of the live price stay in the main "
-                             "table (0.05 = 5%%); farther ones move to an appendix. "
-                             "新手建议用 0.05，避免一次面对十几张单子")
+    parser.add_argument("--near", type=float, default=0.0, help="Distance filter: only orders within X of the live price stay in the main table (0.05 = 5%%); farther ones move to an appendix.")
+    parser.add_argument("--mark-active", metavar="YYYY-MM-DD",
+                        help="登记一个「有成交的交易日」（官方硬门槛：累计 ≥ 5 天才有评奖资格），"
+                             "登记后直接退出。按**交易日**口径，夜盘成交算下一个交易日")
     args = parser.parse_args()
+
+    if args.mark_active:
+        book = load_book(Path(args.state))
+        day = args.mark_active.strip()
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            print(f"日期格式不对：{day}（应为 YYYY-MM-DD）")
+            raise SystemExit(1)
+        if day in book.active_days:
+            print(f"{day} 已在记录中，不重复登记。")
+        else:
+            book.active_days = sorted(set(book.active_days) | {day})
+            print(f"已登记 {day}。活跃交易日进度：{len(book.active_days)} / {MIN_ACTIVE_DAYS}")
+            if len(book.active_days) >= MIN_ACTIVE_DAYS:
+                print("✅ 已达到官方活跃交易日门槛。")
+            else:
+                print(f"⚠️ 还差 {MIN_ACTIVE_DAYS - len(book.active_days)} 天，达不到将直接失去评奖资格。")
+        save_book(book, Path(args.state))
+        return
 
     entries = load_universe(tiers=tuple(args.tiers.split(",")))
     products = load_products()
