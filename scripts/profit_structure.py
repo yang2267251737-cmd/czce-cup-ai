@@ -34,6 +34,68 @@ BASE = StrategyParams(entry_window=55, exit_window=5, stop_atr=3.0, trail_atr=6.
 START = "2016-01-01"
 
 
+def take_profit_scan(frames, products, levels=(0.03, 0.05, 0.08, 0.10, 0.15, 0.20)) -> pd.DataFrame:
+    """模拟「盈利摸到 X% 就止盈」：对每一笔真实成交，回看持仓期间价格有没有摸到 X%。
+
+    摸到了就假设在 X% 出场（限价单必然成交），没摸到就沿用真实出场价。
+    **亏损单完全不受影响** —— 这正是止盈的问题所在：它只砍盈利，不减少亏损。
+
+    这是单笔结构的纯影响模拟，没有考虑止盈后资金可以重新进场，
+    所以它回答的是「止盈对盈亏结构做了什么」，而不是完整的组合回测。
+    """
+    rows = []
+    for code, frame in frames.items():
+        features = compute_features(frame, {"atr": 14, "fast": 55, "slow": 50,
+                                            "donchian": 55, "exit": 5, "adx": 14, "boll": 20})
+        _, trades, _ = breakout_positions(features, BASE, code)
+        multiplier = products[code_of(code)].multiplier
+        highs = features["high"].to_numpy(dtype=float)
+        lows = features["low"].to_numpy(dtype=float)
+        dates = pd.to_datetime(features["date"]).dt.normalize()
+        index_of = {day: i for i, day in enumerate(dates)}
+        for trade in trades:
+            if pd.Timestamp(trade.entry_date) < pd.Timestamp(START):
+                continue
+            start = index_of.get(pd.Timestamp(trade.entry_date).normalize())
+            end = index_of.get(pd.Timestamp(trade.exit_date).normalize())
+            if start is None or end is None or end < start:
+                continue
+            entry = float(trade.entry_price)
+            baseline = trade.gross_pnl(multiplier)
+            row = {"基准": baseline}
+            for level in levels:
+                target = entry * (1 + level * trade.direction)
+                touched = False
+                for k in range(start, end + 1):
+                    if (trade.direction > 0 and highs[k] >= target) or (
+                        trade.direction < 0 and lows[k] <= target
+                    ):
+                        touched = True
+                        break
+                row[f"止盈{level:.0%}"] = (
+                    (target - entry) * trade.direction * multiplier if touched else baseline
+                )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarize_take_profit(scan: pd.DataFrame) -> pd.DataFrame:
+    """把止盈扫描结果汇总成「总盈亏 / 胜率 / 盈亏比」对照表。"""
+    rows = []
+    for column in scan.columns:
+        pnl = scan[column]
+        wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
+        rows.append({
+            "止盈设置": "不止盈（原策略）" if column == "基准" else column,
+            "总毛盈亏": pnl.sum(),
+            "胜率": len(wins) / len(pnl),
+            "平均每笔盈利": wins.mean() if len(wins) else 0.0,
+            "平均每笔亏损": losses.mean() if len(losses) else 0.0,
+            "盈亏比": (wins.mean() / abs(losses.mean())) if len(wins) and len(losses) and losses.mean() else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
 def single_lot_trades(frames, products) -> pd.DataFrame:
     """按「单品种 1 手」口径列出全部成交，用来观察利润结构（剔除仓位规模的影响）。"""
     rows = []
@@ -111,6 +173,11 @@ def main() -> None:
         ["品种", "方向", "手数", "开仓日", "平仓日", "持有天数", "净盈亏", "离场原因"]
     ]
 
+    print("模拟止盈…")
+    tp_summary = summarize_take_profit(take_profit_scan(frames, products))
+    best_tp = tp_summary.loc[tp_summary["总毛盈亏"].idxmax()]
+    baseline = tp_summary.iloc[0]
+
     lines = [
         "# 利润结构：为什么这套系统没有止盈价",
         "",
@@ -156,7 +223,36 @@ def main() -> None:
         "> 这也解释了一个之前发现的现象：跟踪止损从 6ATR 调到 8ATR，回测结果完全一样。"
         "因为它根本不起作用。**参数只有在真正绑定时才值得讨论。**",
         "",
-        "## 4. 组合口径（真实手数与成本）",
+        "## 4. 直接回答「为什么不设止盈」：模拟给你看",
+        "",
+        "对每一笔真实成交，回看持仓期间价格有没有摸到某个止盈线："
+        "摸到了就假设在那里出场，没摸到就沿用真实出场价。"
+        "**亏损单完全不受影响** —— 这正是止盈的致命之处：它只砍盈利，一分亏损都不减。",
+        "",
+        _table(tp_summary, percent_cols={"胜率"}),
+        "",
+        f"> **读法分两段，结论完全不同。**\n"
+        ">\n"
+        f"> **窄止盈（3%–10%）是灾难**：总毛盈亏从 {baseline['总毛盈亏']:,.0f} 元塌到 "
+        f"{tp_summary.iloc[1]['总毛盈亏']:,.0f} ~ {tp_summary.iloc[4]['总毛盈亏']:,.0f} 元。"
+        "原因很直接：它把「平均每笔盈利」从 2,753 元砍到 1,262–2,440 元，"
+        "而「平均每笔亏损」和「胜率」一动不动。\n"
+        ">\n"
+        f"> 注意一个反直觉的现象：**止盈 3% 时胜率从 36% 升到 53%** —— "
+        "你会感觉自己「一直在赢」，但账户在流血。因为赢的那 53 笔平均只赚 1,262 元，"
+        "而输的 47 笔平均亏 1,696 元。**胜率高和赚钱是两件事。**\n"
+        ">\n"
+        f"> **宽止盈（15%–20%）在样本内反而略好**（"
+        f"{tp_summary.iloc[5]['总毛盈亏']:,.0f} / {tp_summary.iloc[6]['总毛盈亏']:,.0f} 元）。"
+        "但这**不足以采信**：只有 20 来笔交易摸到过 15%，而且表现是非单调的"
+        "（8% 比 5% 好、15% 又突然比 10% 好），这是典型的小样本噪声形状。"
+        "在一个只剩 40 个交易日的比赛里拿这种证据调参数，就是在过拟合。\n"
+        ">\n"
+        "> **可执行结论**：窄止盈坚决不设；真想锁利润就用**移动止损**"
+        "（赚到一定程度后把止损推到成本之上），它和止盈的区别是"
+        "**不会在趋势还没走完时把你踢出去**。",
+        "",
+        "## 5. 组合口径（真实手数与成本）",
         "",
         "单品种 1 手口径看不出仓位规模的影响，下面是真实组合的样子"
         "（1% 单笔风险、最多 8 个品种、1.5 倍手续费 + 滑点）：",

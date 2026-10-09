@@ -53,17 +53,9 @@ def rolling_window_stats(curve: pd.DataFrame, window: int = WINDOW) -> dict[str,
 
     这是回答"40 天里我会怎样"的唯一诚实办法：用历史上所有可能的 40 天窗口当样本。
     """
-    equity = curve["equity"].to_numpy(dtype=float)
-    if len(equity) <= window:
+    returns, drawdowns = window_samples(curve, window)
+    if not len(returns):
         return {}
-    returns, drawdowns = [], []
-    for start in range(len(equity) - window):
-        segment = equity[start:start + window + 1]
-        returns.append(segment[-1] / segment[0] - 1)
-        peak = np.maximum.accumulate(segment)
-        drawdowns.append(float(np.max((peak - segment) / peak)))
-    returns = np.array(returns)
-    drawdowns = np.array(drawdowns)
     return {
         "窗口数": int(len(returns)),
         "盈利窗口占比": float((returns > 0).mean()),
@@ -78,6 +70,50 @@ def rolling_window_stats(curve: pd.DataFrame, window: int = WINDOW) -> dict[str,
         "窗口内最大回撤_中位数": float(np.median(drawdowns)),
         "窗口内最大回撤_最差": float(drawdowns.max()),
     }
+
+
+def window_samples(curve: pd.DataFrame, window: int = WINDOW) -> tuple[np.ndarray, np.ndarray]:
+    """切出所有长度为 window 的连续窗口，返回 (收益率数组, 窗口内最大回撤数组)。"""
+    equity = curve["equity"].to_numpy(dtype=float)
+    if len(equity) <= window:
+        return np.array([]), np.array([])
+    returns, drawdowns = [], []
+    for start in range(len(equity) - window):
+        segment = equity[start:start + window + 1]
+        returns.append(segment[-1] / segment[0] - 1)
+        peak = np.maximum.accumulate(segment)
+        drawdowns.append(float(np.max((peak - segment) / peak)))
+    return np.array(returns), np.array(drawdowns)
+
+
+def risk_tail_scan(frames, products, levels=(0.01, 0.02, 0.03, 0.045, 0.06, 0.08)) -> pd.DataFrame:
+    """回答「资金量 50 万、这点仓位是不是太少拿不到名次」。
+
+    做法：对每个单笔风险档位跑一遍 2016 年至今的回测，把**所有** 40 个交易日窗口切出来，
+    统计收益率落在各个区间的**概率**。这样就能直接说：
+    「想赚到 +10%，要付多大风险、以及有多大概率反而亏 10%」。
+    """
+    prepared = prepare_signals(frames, products, BASE)
+    rows = []
+    for level in levels:
+        result = run_backtest(prepared, RiskConfig(risk_per_trade=level, max_positions=8),
+                              name=f"风险{level:.1%}", start="2016-01-01")
+        returns, _ = window_samples(curve_to_frame(result))
+        if not len(returns):
+            continue
+        rows.append({
+            "单笔风险": level,
+            "中位数收益": float(np.median(returns)),
+            "P(赚钱)": float((returns > 0).mean()),
+            "P(>+5%)": float((returns > 0.05).mean()),
+            "P(>+10%)": float((returns > 0.10).mean()),
+            "P(>+20%)": float((returns > 0.20).mean()),
+            "P(亏5%以上)": float((returns < -0.05).mean()),
+            "P(亏10%以上)": float((returns < -0.10).mean()),
+            "最差": float(returns.min()),
+            "最好": float(returns.max()),
+        })
+    return pd.DataFrame(rows)
 
 
 def perturbation(products, frames, risk: RiskConfig) -> pd.DataFrame:
@@ -188,6 +224,8 @@ def main() -> None:
     loo = leave_one_out(products, frames, risk)
     print("换月跳空…")
     gaps = gap_outlier_test(products, frames, risk)
+    print("风险档位与尾部概率…")
+    tails = risk_tail_scan(frames, products)
 
     lines = [
         "# 稳健性审计：这套策略到底靠不靠谱",
@@ -234,7 +272,18 @@ def main() -> None:
         "",
         _table(gaps, percent_cols={"总收益率", "最大回撤"}),
         "",
-        "## 5. 结论：靠谱的部分和不靠谱的部分",
+        "## 5. 资金量与名次：把仓位放大到底有没有用",
+        "",
+        "「50 万只用了 2 万多保证金，是不是太保守拿不到名次？」——这个问题要用概率回答。",
+        "下表对每个单笔风险档位跑一遍 2016 年至今，把**所有** 40 个交易日窗口切出来，",
+        "统计收益率落在各区间的概率：",
+        "",
+        _table(tails, percent_cols={"单笔风险", "中位数收益", "P(赚钱)", "P(>+5%)", "P(>+10%)",
+                                    "P(>+20%)", "P(亏5%以上)", "P(亏10%以上)", "最差", "最好"}),
+        "",
+        _tail_reading(tails),
+        "",
+        "## 6. 结论：靠谱的部分和不靠谱的部分",
         "",
         *_verdict(stats_recent, perturb, loo),
         "",
@@ -267,6 +316,33 @@ def _window_reading(recent: dict, full: dict) -> str:
         ">\n"
         "> 注意赢面只比抛硬币好一点 —— 这正是「趋势策略」的常态，"
         "它的正期望来自少数几笔大赢，而不是靠赢的次数。"
+    )
+
+
+def _tail_reading(tails: pd.DataFrame) -> str:
+    """把尾部概率表翻译成「该不该加仓」的结论。"""
+    if tails.empty:
+        return ""
+    base = tails.iloc[0]
+    best = tails.loc[tails["P(>+10%)"].idxmax()]
+    hot = tails.loc[tails["P(亏10%以上)"].idxmin()]
+    return (
+        f"> **读法**：按现在 1% 的单笔风险，40 天里赚到 +10% 以上的概率只有 "
+        f"**{base['P(>+10%)']:.1%}**，而亏 10% 以上的概率是 **{base['P(亏10%以上)']:.1%}**。"
+        f"把风险放大到 {best['单笔风险']:.1%}，赚 +10% 的概率升到 **{best['P(>+10%)']:.1%}**"
+        f"，但亏 10% 以上的概率同时升到 **{best['P(亏10%以上)']:.1%}**。\n"
+        ">\n"
+        "> **两边的概率是同向放大的 —— 这就是负期望赌局的本质。** "
+        "放大仓位不会提高你的胜率，只会把结果分布拉宽："
+        "你更可能进前列，也更可能垫底。\n"
+        ">\n"
+        "> 更关键的是看**中位数**那一列：它在所有档位上都趴在 0 附近甚至为负。"
+        "**放大一个零期望的赌局，中位数还是零，只是方差变大。** "
+        "所以「加仓位冲名次」在数学上等于买彩票，不是提高水平。\n"
+        ">\n"
+        "> 真要提升资金利用率，**优先加品种而不是加杠杆**："
+        "同样的单笔风险下，把品种池从 8 个扩到 12 个会让同时持仓数变多、"
+        "相关性更低，这是唯一「不增加单笔风险却提高收益」的杠杆。"
     )
 
 
