@@ -51,6 +51,62 @@ SESSIONS: dict[str, tuple[str, str]] = {
 """交易时段（北京时间）。夜盘属于**下一个**交易日。"""
 
 
+def fetch_live_quotes() -> dict[str, dict[str, float]]:
+    """联网抓取郑商所各合约的**实时快照**（最新价 / 上日结算价 / 涨跌幅）。
+
+    用途是给每日计划做「实时价对照」：计划里的触发价是按收盘数据算的，
+    盘中价格可能已经跑远，必须先看一眼实时价再决定挂不挂单。
+
+    注意：``涨跌幅`` 是相对**上日结算价**而不是上日收盘价 ——
+    这是国内期货软件的惯例，也是「为什么截图里的昨收和你的数据对不上」的原因。
+    """
+    import akshare as ak
+
+    frame = ak.futures_fees_info()
+    czce = frame[frame["交易所"] == "CZCE"]
+    quotes: dict[str, dict[str, float]] = {}
+    for _, row in czce.iterrows():
+        contract = str(row["合约代码"])
+        try:
+            latest = float(row.get("最新价") or 0.0)
+            settle = float(row.get("上日结算价") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if latest <= 0:
+            continue
+        quotes[contract] = {
+            "latest": latest,
+            "prev_settle": settle,
+            "change": (latest / settle - 1) if settle > 0 else 0.0,
+            "open_interest": float(row.get("持仓量") or 0.0),
+        }
+    return quotes
+
+
+def tradable_contracts(products: dict[str, "Product"], today: date | None = None,
+                       min_months: int = 2) -> dict[str, list[str]]:
+    """列出每个品种**可以下单**的合约及其到期月，用于避免误买临交割合约。
+
+    「交割月前一交易日停止交易」是赛制硬约束：例如玻璃 2026年10月交割的 FG610，
+    现在已经处在交割月，个人客户既不能开新仓，价格也失真。
+    """
+    import akshare as ak
+
+    today = today or date.today()
+    frame = ak.futures_fees_info()
+    czce = frame[frame["交易所"] == "CZCE"]
+    out: dict[str, list[str]] = {}
+    for code in products:
+        rows = czce[czce["品种代码"] == code]
+        valid = []
+        for contract in rows["合约代码"].astype(str):
+            delivery = parse_delivery(contract, today)
+            if delivery and months_until(delivery, today) >= min_months:
+                valid.append(contract)
+        out[code] = sorted(valid)
+    return out
+
+
 def parse_delivery(code: str, today: date) -> str | None:
     """把 CZCE 合约代码（如 CF701）解析成到期年月 ``YYYY-MM``；连续合约返回 None。
 

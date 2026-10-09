@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from backtest import prepare_signals, run_backtest
-from contracts import load_products, roll_warnings
+from contracts import fetch_live_quotes, load_products, roll_warnings
 from indicators import compute_features, describe_snapshot
 from market_data import last_completed_bar, load_daily, quality_report, stale_warning
 from risk import RiskConfig, portfolio_guard, size_position
@@ -167,6 +167,7 @@ def build_plan(
     params: StrategyParams,
     target_day: date,
     last_bar_date: date,
+    quotes: dict[str, dict[str, float]] | None = None,
 ) -> dict:
     """把行情、策略状态与账户账簿合成一份完整的次日操作方案。"""
     allowed, guard_note, risk_multiplier = portfolio_guard(
@@ -188,9 +189,14 @@ def build_plan(
         last_bar = features[code].dropna(subset=["atr"]).iloc[-1]
         price = float(last_bar["close"])
         atr_now = float(last_bar["atr"])
+        # 实时价对照：计划里的触发价是按收盘算的，盘中可能已经跑远
+        live = (quotes or {}).get(product.main_contract, {})
+        live_price = float(live.get("latest") or 0.0) or price
+        live_change = float(live.get("change") or 0.0)
 
         market.append({
-            "代码": product_code, "名称": entry.name, "收盘": price,
+            "代码": product_code, "名称": entry.name, "下单合约": product.main_contract,
+            "收盘": price, "实时价": live_price, "日内涨跌": live_change,
             "ATR": atr_now, "ATR%": atr_now / price,
             "ADX": snapshot["adx"], "状态": snapshot["regime"],
             "波动分位": snapshot["vol_pctile"],
@@ -202,13 +208,14 @@ def build_plan(
         if held is not None:
             stop = float(plan.stop) if np.isfinite(plan.stop) else held.get("stop")
             manage.append({
-                "代码": product_code, "名称": entry.name,
+                "代码": product_code, "名称": entry.name, "订单合约": product.main_contract,
                 "方向": "多" if held["direction"] > 0 else "空",
                 "手数": held["lots"], "开仓价": held["entry_price"],
                 "当前止损": stop,
                 "止损调整": "上移" if stop and held.get("stop") and stop > held["stop"] and held["direction"] > 0
                             else ("下移" if stop and held.get("stop") and stop < held["stop"] and held["direction"] < 0 else "维持"),
                 "离场触发": plan.exit_trigger,
+                "实时价": live_price,
                 "备注": plan.note,
             })
             continue
@@ -218,8 +225,9 @@ def build_plan(
             stop_text = f"{plan.stop:.2f}" if np.isfinite(plan.stop) else "—"
             blocked.append({
                 "代码": product_code, "名称": entry.name,
+                "订单合约": product.main_contract,
                 "方向": "多" if plan.direction > 0 else "空",
-                "当前价": round(price, 2),
+                "实时价": live_price,
                 "系统止损": stop_text,
                 "原因": (
                     f"系统口径下该品种已处于{'多' if plan.direction > 0 else '空'}头，"
@@ -236,15 +244,18 @@ def build_plan(
                                           (-1, plan.stop, "向下跌破做空")):
             if not np.isfinite(trigger):
                 continue
-            distance = abs(trigger - price) / price
+            distance = abs(trigger - live_price) / live_price
             stop_distance = params.stop_atr * atr_now
             lots, detail = size_position(
                 book.equity, risk, product, trigger, stop_distance,
                 remaining_margin=remaining_margin, risk_multiplier=risk_multiplier,
             )
             order = {
-                "代码": product_code, "名称": entry.name, "动作": label,
-                "触发价": round(trigger, 2), "当前价": round(price, 2),
+                "代码": product_code, "名称": entry.name,
+                "订单合约": product.main_contract,
+                "动作": label,
+                "触发价": round(trigger, 2), "收盘价": round(price, 2),
+                "实时价": round(live_price, 2), "日内涨跌": live_change,
                 "距离": distance, "方向": direction,
                 "建议手数": lots,
                 "初始止损": round(trigger - direction * stop_distance, 2),
@@ -354,6 +365,18 @@ def _summary_section(plan: dict) -> list[str]:
 def _orders_section(plan: dict) -> list[str]:
     """二、新开仓挂单表。"""
     lines = ["## 二、新开仓挂单表", "",
+             "> ## ⛔ 下单前必读：只能买「具体月份合约」",
+             ">",
+             "> 行情软件里的 **指数**（玻璃指数、PTA指数、白糖指数/SR_INDEX）、"
+             "**主连**（玻璃主连、PTA主连）和 **近月** 都是**合成出来的行情序列，不是真实合约，下不了单**。",
+             ">",
+             "> 怎么一眼认出来：**主连的成交量和持仓量，永远等于当前主力合约的那两个数字**。"
+             "例如「玻璃主连」成交量 1101979，和「玻璃701」完全一样 —— 它就是 701 的镜像。",
+             ">",
+             "> 下表「订单合约」一列**就是要下单的合约代码**，照着填即可。",
+             "> 同时**不要碰 610/611/612 这类临近交割的合约**：赛制规定交割月前一交易日停止交易，"
+             "个人客户进不了交割月。",
+             "",
              "按券商软件里的「条件单」理解：**价格触到就手动下单**。手数是按"
              "「单笔风险占权益固定比例」反推出来的，不是拍脑袋定的。", "",
              "> ⚠️ **同一品种出现多空两单时是二选一**：任一方向成交后，"
@@ -362,13 +385,13 @@ def _orders_section(plan: dict) -> list[str]:
         lines.append("_今天没有任何品种给出入场信号。_")
         lines.append("")
         return lines
-    lines.append("| 品种 | 方向 | 触发价 | 距现价 | 手数 | 初始止损 | 单笔风险 | 往返成本 | 占用保证金 | 可否执行 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| 订单合约 | 品种 | 方向 | 触发价 | 实时价 | 距实时价 | 手数 | 初始止损 | 单笔风险 | 往返成本 | 占用保证金 | 可否执行 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for order in plan["orders"]:
         status = "✅ 可执行" if order["可用"] else f"⛔ {order['不可用原因']}"
         lines.append(
-            f"| {order['名称']} {order['代码']} | {order['动作']} | {order['触发价']:.2f} "
-            f"| {order['距离']:.2%} | {order['建议手数']} | {order['初始止损']:.2f} "
+            f"| **{order['订单合约']}** | {order['名称']} | {order['动作']} | {order['触发价']:.2f} "
+            f"| {order['实时价']:.2f} | {order['距离']:.2%} | {order['建议手数']} | {order['初始止损']:.2f} "
             f"| {order['单笔风险(元)']:,.0f} 元 | {order['预估往返成本(元)']:,.1f} 元 "
             f"| {order['保证金(元)']:,.0f} 元 | {status} |"
         )
@@ -378,7 +401,7 @@ def _orders_section(plan: dict) -> list[str]:
         if not order["可用"] or order["代码"] in seen:
             continue
         seen.add(order["代码"])
-        lines.append(f"- {order['代码']}：{order['执行时点']}")
+        lines.append(f"- {order['订单合约']}（{order['代码']}）：{order['执行时点']}")
     lines.append("")
     return lines
 
@@ -388,11 +411,11 @@ def _blocked_section(plan: dict) -> list[str]:
     if not plan["blocked"]:
         return []
     lines = ["## 附：今天不做的信号及原因", ""]
-    lines.append("| 品种 | 系统方向 | 当前价 | 系统止损 | 为什么不做 |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| 订单合约 | 品种 | 系统方向 | 实时价 | 系统止损 | 为什么不做 |")
+    lines.append("|---|---|---|---|---|---|")
     for item in plan["blocked"]:
         lines.append(
-            f"| {item['名称']} {item['代码']} | {item['方向']} | {item['当前价']} "
+            f"| **{item['订单合约']}** | {item['名称']} | {item['方向']} | {item['实时价']:.2f} "
             f"| {item['系统止损']} | {item['原因']} |"
         )
     lines.append("")
@@ -406,14 +429,14 @@ def _manage_section(plan: dict) -> list[str]:
         lines.append("_当前空仓，无需管理。_")
         lines.append("")
         return lines
-    lines.append("| 品种 | 方向 | 手数 | 开仓价 | 止损价 | 止损调整 | 反向离场触发 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| 订单合约 | 品种 | 方向 | 手数 | 开仓价 | 实时价 | 止损价 | 止损调整 | 反向离场触发 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for item in plan["manage"]:
         stop_text = f"{item['当前止损']:.2f}" if isinstance(item["当前止损"], (int, float)) and np.isfinite(item["当前止损"]) else "—"
         exit_text = f"{item['离场触发']:.2f}" if isinstance(item["离场触发"], (int, float)) and np.isfinite(item["离场触发"]) else "—"
         lines.append(
-            f"| {item['名称']} {item['代码']} | {item['方向']} | {item['手数']} | {item['开仓价']} "
-            f"| **{stop_text}** | {item['止损调整']} | {exit_text} |"
+            f"| **{item['订单合约']}** | {item['名称']} | {item['方向']} | {item['手数']} | {item['开仓价']} "
+            f"| {item.get('实时价', float('nan')):.2f} | **{stop_text}** | {item['止损调整']} | {exit_text} |"
         )
     lines.extend([
         "",
@@ -428,15 +451,17 @@ def _market_section(plan: dict) -> list[str]:
     """四、市场状态总览。"""
     lines = ["## 四、市场状态总览", "",
              "「状态」由 ADX 判定：≥25 趋势市，<20 震荡市。趋势市里突破策略胜率更高，"
-             "震荡市里更容易被反复止损。", "",
-             "| 品种 | 收盘 | ATR | ATR% | ADX | 状态 | 波动率分位 | 当前方向 |",
-             "|---|---|---|---|---|---|---|---|"]
+             "震荡市里更容易被反复止损。**下单只认「订单合约」那一列。**", "",
+             "| 订单合约 | 品种 | 收盘(基准) | 实时价 | 日内 | ATR | ATR% | ADX | 状态 | 波动率分位 | 当前方向 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for item in plan["market"]:
         direction = {1: "多", -1: "空", 0: "空仓"}.get(item["当前方向"], "空仓")
         percentile = f"{item['波动分位']:.0%}" if np.isfinite(item["波动分位"]) else "—"
+        change = item.get("日内涨跌", 0.0)
         lines.append(
-            f"| {item['名称']} {item['代码']} | {item['收盘']:.1f} | {item['ATR']:.1f} "
-            f"| {item['ATR%']:.2%} | {item['ADX']:.1f} | {item['状态']} | {percentile} | {direction} |"
+            f"| **{item['下单合约']}** | {item['名称']} | {item['收盘']:.1f} | {item['实时价']:.1f} "
+            f"| {change:+.2%} | {item['ATR']:.1f} | {item['ATR%']:.2%} | {item['ADX']:.1f} "
+            f"| {item['状态']} | {percentile} | {direction} |"
         )
     lines.append("")
     return lines
@@ -585,13 +610,25 @@ def main() -> None:
         target, last_bar_date = estimate_next_trading_day(frames, now)
         if target <= now.date():
             notes.append(
-                f"**这份清单针对的交易日 {target.isoformat()} 已经开始或已过半程**："
-                "当前时间还没到 15:00，当天日线尚未收盘，所以依据的是上一根已收盘 K 线。"
-                "建议每日 15:10 之后重新运行，才有完整意义。"
+                f"**这份清单针对的交易日 {target.isoformat()} 已经开始（现在 {now:%H:%M}）**："
+                "行情源还没发布当天已收盘的日线（新浪通常要到傍晚才更新），"
+                "所以依据的是**上一根**已收盘 K 线，盘中的价格变动没有反映进去。"
+                "正确做法是每个交易日 **15:10 之后、等行情源更新完再运行**；"
+                "下表的「实时价」一列是盘中快照，可以拿来对照触发价还差多远。"
             )
 
+    quotes: dict[str, dict[str, float]] = {}
+    try:
+        quotes = fetch_live_quotes()
+        print(f"[实时价] 已获取 {len(quotes)} 个合约的盘中快照", file=sys.stderr)
+    except Exception as exc:  # 实时价只是锦上添花，拿不到就用收盘价兜底
+        notes.append(
+            f"**未能获取实时价**（{type(exc).__name__}）：下表「实时价」一列等于收盘价，"
+            "挂单前请自己在软件里核对当前价。"
+        )
+
     plan = build_plan(entries, products, frames, features, states, book, risk, params,
-                      target, last_bar_date)
+                      target, last_bar_date, quotes)
 
     for line in roll_warnings(products):
         if any(entry.code in line for entry in entries):
