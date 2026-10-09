@@ -1,8 +1,41 @@
 {
-  "_note": "账户账簿：每次实际成交后手工更新。scripts/daily_plan.py 会读取它。",
-  "equity": 500000.0,
-  "peak_equity": 500000.0,
-  "positions": [],
+  "_note": "账户账簿：每次实际成交后手工更新。scripts/daily_plan.py 会读取它计算手数、止损与风控状态。entry_date 用**交易日**（夜盘属于下一交易日），平今/平仓手续费按它判断。",
+  "equity": 500235.25,
+  "peak_equity": 500235.25,
+  "positions": [
+    {
+      "code": "SR",
+      "direction": 1,
+      "lots": 2,
+      "entry_price": 5509.0,
+      "entry_date": "2026-10-12",
+      "stop": null
+    },
+    {
+      "code": "FG",
+      "direction": -1,
+      "lots": 3,
+      "entry_price": 863.0,
+      "entry_date": "2026-10-12",
+      "stop": null
+    },
+    {
+      "code": "OI",
+      "direction": 1,
+      "lots": 1,
+      "entry_price": 10357.0,
+      "entry_date": "2026-10-12",
+      "stop": null
+    },
+    {
+      "code": "RM",
+      "direction": 1,
+      "lots": 3,
+      "entry_price": 2384.0,
+      "entry_date": "2026-10-12",
+      "stop": null
+    }
+  ],
   "last_updated": "2026-10-09",
-  "notes": "空仓起步。每次实际成交后请手工更新本文件，daily_plan 会据此计算手数与风控状态。"
+  "notes": "2026-10-09 夜盘（属于交易日 2026-10-12）开仓 4 笔。实际成交价与计划触发价不同（菜油、菜粕为提前入场），因此止损必须按实际开仓价重算，不能照搬计划里的止损价。"
 }

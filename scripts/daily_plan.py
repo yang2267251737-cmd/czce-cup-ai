@@ -156,6 +156,36 @@ def _weekday_cn(day: date) -> str:
     return "周" + "一二三四五六日"[day.weekday()]
 
 
+def book_stop(held: dict, close: float, atr_now: float, params: StrategyParams) -> tuple[float, str]:
+    """按账簿里的**实际开仓价**重算保护性止损，而不是照搬系统口径。
+
+    为什么必须重算：系统口径的止损 = 系统的触发价 ∓ 3ATR。如果你在别的价位成交
+    （提前入场、或者开盘跳空），照搬那个价会让止损距离缩成 0.7 个 ATR 而不是 3 个 ——
+    正常波动就能把你打出去，同时「单笔风险 1%」这个前提也失效了。
+
+    规则（和回测里完全一致）：
+    - 建仓止损 = 开仓价 ∓ ``stop_atr`` × ATR
+    - 移动止损 = 最新收盘 ∓ ``trail_atr`` × ATR，只朝有利方向移动
+    - 两者取对持仓**更有利**（更近）的那个，并且绝不越过账簿里已记录的止损
+    """
+    direction = int(held["direction"])
+    entry = float(held["entry_price"])
+    initial = entry - direction * params.stop_atr * atr_now
+    chandelier = close - direction * params.trail_atr * atr_now
+    stop = initial
+    basis = f"建仓止损（开仓价 {entry:.2f} ∓ {params.stop_atr:.0f}ATR）"
+    if (direction > 0 and chandelier > stop) or (direction < 0 and chandelier < stop):
+        stop = chandelier
+        basis = f"移动止损（收盘 {close:.2f} ∓ {params.trail_atr:.0f}ATR）"
+    recorded = held.get("stop")
+    if recorded is not None and np.isfinite(float(recorded)):
+        recorded = float(recorded)
+        if (direction > 0 and recorded > stop) or (direction < 0 and recorded < stop):
+            stop = recorded
+            basis = "沿用账簿里已记录的止损"
+    return float(stop), basis
+
+
 def build_plan(
     entries,
     products,
@@ -206,16 +236,29 @@ def build_plan(
 
         held = next((position for position in book.positions if position["code"] == product_code), None)
         if held is not None:
-            stop = float(plan.stop) if np.isfinite(plan.stop) else held.get("stop")
+            stop, stop_basis = book_stop(held, price, atr_now, params)
+            # 反向离场必须**从行情直接取**，不能沿用 next_bar_plan 的结果：
+            # 系统口径下这品种可能是空仓，那样 exit_trigger 会是 NaN，而用户实际持仓。
+            exit_ref = float(last_bar["exit_dn"] if held["direction"] > 0 else last_bar["exit_up"])
+            previous = held.get("stop")
+            if previous is None or not np.isfinite(float(previous)):
+                adjustment = "新建"
+            elif float(stop) > float(previous):
+                adjustment = "上移"
+            elif float(stop) < float(previous):
+                adjustment = "下移"
+            else:
+                adjustment = "维持"
             manage.append({
                 "代码": product_code, "名称": entry.name, "订单合约": product.main_contract,
                 "方向": "多" if held["direction"] > 0 else "空",
                 "手数": held["lots"], "开仓价": held["entry_price"],
                 "当前止损": stop,
-                "止损调整": "上移" if stop and held.get("stop") and stop > held["stop"] and held["direction"] > 0
-                            else ("下移" if stop and held.get("stop") and stop < held["stop"] and held["direction"] < 0 else "维持"),
-                "离场触发": plan.exit_trigger,
+                "止损依据": stop_basis,
+                "止损调整": adjustment,
+                "离场触发": round(exit_ref, 2),
                 "实时价": live_price,
+                "单手风险(元)": round(abs(float(held["entry_price"]) - stop) * product.multiplier, 2),
                 "备注": plan.note,
             })
             continue
@@ -451,14 +494,15 @@ def _manage_section(plan: dict) -> list[str]:
         lines.append("_当前空仓，无需管理。_")
         lines.append("")
         return lines
-    lines.append("| 订单合约 | 品种 | 方向 | 手数 | 开仓价 | 实时价 | 止损价 | 止损调整 | 反向离场触发 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("| 订单合约 | 品种 | 方向 | 手数 | 开仓价 | 实时价 | **必须挂的止损** | 止损依据 | 单手风险 | 反向离场触发 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for item in plan["manage"]:
         stop_text = f"{item['当前止损']:.2f}" if isinstance(item["当前止损"], (int, float)) and np.isfinite(item["当前止损"]) else "—"
         exit_text = f"{item['离场触发']:.2f}" if isinstance(item["离场触发"], (int, float)) and np.isfinite(item["离场触发"]) else "—"
         lines.append(
             f"| **{item['订单合约']}** | {item['名称']} | {item['方向']} | {item['手数']} | {item['开仓价']} "
-            f"| {item.get('实时价', float('nan')):.2f} | **{stop_text}** | {item['止损调整']} | {exit_text} |"
+            f"| {item.get('实时价', float('nan')):.2f} | **{stop_text}** | {item.get('止损依据', '—')} "
+            f"| {item.get('单手风险(元)', 0):,.0f} 元 | {exit_text} |"
         )
     lines.extend([
         "",
