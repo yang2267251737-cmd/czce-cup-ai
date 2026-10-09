@@ -321,6 +321,7 @@ def render_markdown(plan: dict, products, notes: list[str]) -> str:
 
     lines.extend(_summary_section(plan))
     lines.extend(_orders_section(plan))
+    lines.extend(_far_orders_section(plan))
     lines.extend(_manage_section(plan))
     lines.extend(_market_section(plan))
     lines.extend(_risk_section(plan, book, guard))
@@ -402,6 +403,27 @@ def _orders_section(plan: dict) -> list[str]:
             continue
         seen.add(order["代码"])
         lines.append(f"- {order['订单合约']}（{order['代码']}）：{order['执行时点']}")
+    lines.append("")
+    return lines
+
+
+def _far_orders_section(plan: dict) -> list[str]:
+    """把距离过远、不值得今天挂的挂单收进附录。"""
+    far = plan.get("far_orders") or []
+    if not far:
+        return []
+    threshold = plan.get("near_threshold", 0.0)
+    lines = [
+        f"### 附：距离超过 {threshold:.0%} 的挂单（**今天不用挂**）",
+        "",
+        "价格几天内就会变，挂太远的单子等于没挂。列在这里只是为了让你知道"
+        "「系统还盯着这些位置」，等它靠近了自然会出现在主表里。",
+        "",
+        "| 订单合约 | 方向 | 触发价 | 距实时价 |",
+        "|---|---|---|---|",
+    ]
+    for order in sorted(far, key=lambda item: item["距离"]):
+        lines.append(f"| {order['订单合约']} | {order['动作']} | {order['触发价']:.2f} | {order['距离']:.2%} |")
     lines.append("")
     return lines
 
@@ -555,6 +577,10 @@ def main() -> None:
     parser.add_argument("--state", default=str(STATE_PATH), help="账簿文件路径")
     parser.add_argument("--out", default=str(REPORT_DIR), help="计划输出目录")
     parser.add_argument("--suffix", default="", help="输出文件名后缀，例如 -tracked")
+    parser.add_argument("--near", type=float, default=0.0,
+                        help="Distance filter: only orders within X of the live price stay in the main "
+                             "table (0.05 = 5%%); farther ones move to an appendix. "
+                             "新手建议用 0.05，避免一次面对十几张单子")
     args = parser.parse_args()
 
     entries = load_universe(tiers=tuple(args.tiers.split(",")))
@@ -629,6 +655,14 @@ def main() -> None:
 
     plan = build_plan(entries, products, frames, features, states, book, risk, params,
                       target, last_bar_date, quotes)
+
+    # 新手友好：把太远的挂单挪到附录。价格几天内就会变，挂太远的单子等于没挂。
+    plan["near_threshold"] = args.near
+    if args.near > 0:
+        plan["far_orders"] = [order for order in plan["orders"] if order["距离"] > args.near]
+        plan["orders"] = [order for order in plan["orders"] if order["距离"] <= args.near]
+    else:
+        plan["far_orders"] = []
 
     for line in roll_warnings(products):
         if any(entry.code in line for entry in entries):
