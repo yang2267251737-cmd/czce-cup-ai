@@ -372,6 +372,7 @@ def render_markdown(plan: dict, products, notes: list[str]) -> str:
         lines.extend(f"- {note}" for note in notes)
         lines.append("")
 
+    lines.extend(_action_section(plan, book))
     lines.extend(_summary_section(plan))
     lines.extend(_orders_section(plan))
     lines.extend(_far_orders_section(plan))
@@ -382,6 +383,93 @@ def render_markdown(plan: dict, products, notes: list[str]) -> str:
     lines.extend(_blocked_section(plan))
     lines.extend(_review_section(target))
     return "\n".join(lines) + "\n"
+
+
+def _action_section(plan: dict, book: dict) -> list[str]:
+    """零、今天照做就行 —— 把当天全部动作压缩成一张勾选清单，放在报告最前面。
+
+    之所以要单独做这一节：原来的操作信息散落在第二、三、五节里，
+    用户每天得自己找、自己判断。**流程越短，纪律越容易保持。**
+    """
+    lines = ["## 零、今天照做就行", ""]
+
+    # 数据新鲜度：这是最容易被忽略、后果最直接的一项
+    stale = plan["target_day"] <= datetime.now().date()
+    if stale:
+        lines.append(
+            f"> ⚠️ **数据还没更新完**：行情截止 **{plan['last_bar_date'].isoformat()}**，"
+            f"但清单针对的交易日是 {plan['target_day'].isoformat()}。"
+            "下面的数字**先别照着改**，等行情源出了当天收盘数据再跑一次。"
+        )
+        lines.append("")
+    else:
+        lines.append(
+            f"> ✅ 数据完整：行情截止 **{plan['last_bar_date'].isoformat()} 收盘**，"
+            f"清单针对 **{plan['target_day'].isoformat()}**。"
+        )
+        lines.append("")
+
+    changed = [item for item in plan["manage"] if item["止损调整"] in ("上移", "下移")]
+    kept = [item for item in plan["manage"] if item["止损调整"] == "维持"]
+    usable = [order for order in plan["orders"] if order["可用"]]
+    active = book.get("active_days") or []
+    remaining = max(0, MIN_ACTIVE_DAYS - len(active))
+
+    lines.append("### ① 止损单")
+    lines.append("")
+    if not plan["manage"]:
+        lines.append("- 当前空仓，没有止损单要管。")
+    else:
+        if changed:
+            lines.append(f"- **改这 {len(changed)} 张：**")
+            for item in changed:
+                lines.append(
+                    f"  - `{item['订单合约']}` → 改成 **{item['当前止损']:.2f}**"
+                    f"　（{item.get('止损依据', '')}）"
+                )
+        else:
+            lines.append("- ✅ **一张都不用改。**")
+        lines.append(
+            "- 全部仓位的止损价（对着软件里的云止损单核一遍）："
+        )
+        for item in plan["manage"]:
+            mark = "🔴 要改" if item in changed else "✅ 不变"
+            lines.append(
+                f"  - `{item['订单合约']}`　**{item['当前止损']:.2f}**　{mark}"
+            )
+        lines.append("- 铁律：**止损价只能朝对自己有利的方向调，永远不回调。**")
+    lines.append("")
+
+    lines.append("### ② 新开仓")
+    lines.append("")
+    if not usable:
+        lines.append("- ✅ 今天没有要挂的新单。")
+    else:
+        for order in usable:
+            lines.append(
+                f"- 挂条件单：`{order['订单合约']}` {order['动作']}，"
+                f"触发价 **{order['触发价']:.2f}**，{order['建议手数']} 手，"
+                f"成交后立刻挂止损 **{order['初始止损']:.2f}**"
+            )
+        lines.append("- 同一品种出现多空两单时是**二选一**，成交后立刻撤另一边。")
+    lines.append("")
+
+    lines.append("### ③ 资格与记录")
+    lines.append("")
+    if remaining == 0:
+        lines.append(f"- ✅ 活跃交易日已达门槛（{len(active)} / {MIN_ACTIVE_DAYS} 天）。")
+    else:
+        lines.append(
+            f"- ⚠️ 活跃交易日 **{len(active)} / {MIN_ACTIVE_DAYS} 天**"
+            f"（还差 {remaining} 天，达不到直接失去评奖资格）。"
+        )
+    lines.append(
+        f"- 今天若**有成交**，收盘后登记一次："
+        f"`python scripts/daily_plan.py --mark-active {plan['target_day'].isoformat()}`"
+    )
+    lines.append("- 收盘后请手工填第七节复盘模板（**这节故意留空，别让 AI 代填**）。")
+    lines.append("")
+    return lines
 
 
 def _summary_section(plan: dict) -> list[str]:
@@ -646,7 +734,10 @@ def main() -> None:
     parser.add_argument("--state", default=str(STATE_PATH), help="账簿文件路径")
     parser.add_argument("--out", default=str(REPORT_DIR), help="计划输出目录")
     parser.add_argument("--suffix", default="", help="输出文件名后缀，例如 -tracked")
-    parser.add_argument("--near", type=float, default=0.0, help="Distance filter: only orders within X of the live price stay in the main table (0.05 = 5%%); farther ones move to an appendix.")
+    parser.add_argument("--near", type=float, default=0.05,
+                        help="距离过滤：只把距实时价 X 以内的挂单放进主表（默认 0.05 = 5%%），"
+                             "更远的收进附录。默认值故意不为 0 —— "
+                             "价格几天内就变，一次给十几张远处的单子只会让人放弃执行")
     parser.add_argument("--mark-active", metavar="YYYY-MM-DD",
                         help="登记一个「有成交的交易日」（官方硬门槛：累计 ≥ 5 天才有评奖资格），"
                              "登记后直接退出。按**交易日**口径，夜盘成交算下一个交易日")

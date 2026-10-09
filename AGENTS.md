@@ -3,8 +3,12 @@
 > 这个文件是给 AI 编程助手（Codex / Claude Code / DSH 等）看的。
 > 每次在这个仓库里干活之前先读它，能避免大部分返工。
 >
-> **换新会话时，先读 [`DOCS/HANDOVER.md`](DOCS/HANDOVER.md)** —— 那里有已核实的事实、
-> 跑出来的数字和当前进度。本文件只放**规则**（做什么、不做什么）。
+> **换新会话时，按这个顺序读三份文件：**
+> 1. 本文件 —— **规则**（不能做什么）
+> 2. [`DOCS/HANDOVER.md`](DOCS/HANDOVER.md) —— **事实**（官方规则、回测数字、踩过的坑、当前持仓）
+> 3. [`DOCS/RUNBOOK.md`](DOCS/RUNBOOK.md) —— **流程**（用户说什么，你做什么）
+>
+> 读完先跑一次 `python scripts/daily_plan.py --refresh` 对齐状态，**不要一上来就改代码**。
 
 ## 0. 现状速览（每次开工先对齐）
 
@@ -122,8 +126,8 @@ python scripts/data_probe.py --demo                    # 第一轮的数据探�
 ```text
 config/    品种池 universe.json + 合约规格快照 czce_products.json（提交进仓库，离线可跑）
 scripts/   全部代码，每个模块一个文件
-DOCS/      HANDOVER 交接文档、SPEC 规格书、ROADMAP 路线图、risks 风险清单、
-           decisions 决策日志、interview-notes 面试话术
+DOCS/      RUNBOOK 操作手册（流程）、HANDOVER 交接文档（事实）、SPEC 规格书、
+           ROADMAP 路线图、risks 风险清单、decisions 决策日志、interview-notes 面试话术
 REPORTS/   backtest 回测、robustness 稳健性、profit-structure 利润结构、
            frequency-optimization 赛制优化、daily/ 每日交易计划、img/ 图表
 data/      行情缓存与一次性审计脚本（.gitignore 忽略）
@@ -134,6 +138,7 @@ state/     账户账簿 portfolio.json（手工维护，提交进仓库）
 
 | 想知道什么 | 读哪份 |
 |---|---|
+| **用户说什么我就做什么（流程）** | [`DOCS/RUNBOOK.md`](DOCS/RUNBOOK.md) |
 | 换会话接着干 / 当前进度 / 已核实的数字 | [`DOCS/HANDOVER.md`](DOCS/HANDOVER.md) |
 | 这个项目做什么、不做什么 | [`DOCS/SPEC.md`](DOCS/SPEC.md) |
 | 回测结果与结论 | [`REPORTS/backtest.md`](REPORTS/backtest.md) |
